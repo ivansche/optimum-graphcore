@@ -25,6 +25,7 @@ from typing import Optional
 
 import datasets
 import numpy as np
+import torch
 from datasets import load_dataset, load_metric
 
 import transformers
@@ -445,6 +446,10 @@ def main():
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
+
+        dummy_input = tokenizer("Used to set the model.config.problem_type", return_tensors="pt")
+        dummy_input["labels"] = torch.tensor(train_dataset[0]["label"])
+        model(**dummy_input)
 
     if training_args.do_eval:
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:

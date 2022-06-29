@@ -13,8 +13,8 @@
 #  limitations under the License.
 
 import copy
-from inspect import signature
-from typing import Any, Dict, Optional, Tuple
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -108,6 +108,16 @@ class PipelineMixin:
             raise TypeError(f"ipu_config must be an instance of IPUConfig, but {type(value)} was provided")
         self._ipu_config = value
 
+    def get_ops_to_wrap_for_tracing(self) -> List[Tuple[str, Callable, Callable]]:
+        return []
+
+    def get_transformations(self):
+        raise NotImplementedError("You need to implement get_transformations.")
+
+    @property
+    def input_names(self):
+        return list(inspect.signature(self.forward).parameters.keys())
+
     def parallelize(self):
         """Transform the model to run in an IPU pipeline."""
         self._hooks = []
@@ -178,7 +188,7 @@ class GenerationMethodsMixin:
 
     def prepare_inputs_for_generation(self, input_ids: torch.LongTensor, **kwargs) -> Dict[str, Any]:
         inputs = super().prepare_inputs_for_generation(input_ids, **kwargs)
-        return {k: v for k, v in inputs.items() if k in signature(self._forward_for_generate).parameters}
+        return {k: v for k, v in inputs.items() if k in inspect.signature(self._forward_for_generate).parameters}
 
 
 def get_layer_ipu(layers_per_ipu):
@@ -401,7 +411,7 @@ class OnehotGather(nn.Module):
         """
         Gather the vectors at the specific positions over a batch.
         """
-        num_classes = int(sequence.shape[1])
+        num_classes = sequence.shape[1]
         one_hot_positions = F.one_hot(positions, num_classes)
         if self._is_half:
             one_hot_positions = one_hot_positions.half()
