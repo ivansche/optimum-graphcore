@@ -28,14 +28,15 @@ from transformers import (
     BertForSequenceClassification,
     BertForTokenClassification,
 )
-
 from transformers.utils.fx import _gen_constructor_wrapper
 
-from ....fx.optimization import ChangeTrueDivToMulByInverse, FuseBiasInLinear, MergeLinears, compose
+# from ....fx.optimization import ChangeTrueDivToMulByInverse, FuseBiasInLinear, MergeLinears, compose
+from ....fx.optimization import ChangeTrueDivToMulByInverse, MergeLinears, compose
 from ...fx.transformations import (
     AddPoptorchBlock,
     AddPoptorchBlocksInSeries,
     ClipValues,
+    ClipValuesSymmetric,
     LinearToSerializedLinear,
     OutlineAttribute,
     RecomputationCheckpoint,
@@ -43,18 +44,23 @@ from ...fx.transformations import (
     VocabEmbeddingToSerializedEmbedding,
 )
 from ...fx.utils import symbolic_trace_pipelined_model
-from ...modeling_utils import (
-    OnehotGather,
-    PipelineMixin,
-    SerializedLinear,
-    get_layer_ipu,
-    outline_attribute,
-    recomputation_checkpoint,
-    register,
-)
+from ...modeling_utils import OnehotGather, PipelineMixin, get_layer_ipu, register
 
 
 logger = logging.get_logger(__name__)
+
+
+_OPTIMIZATION_TRANSFORMATIONS = [
+    ChangeTrueDivToMulByInverse(),
+    MergeLinears(),
+    #    FuseBiasInLinear(),
+]
+
+_NON_REVERSIBLE_TRANSFORMATIONS = [
+    ClipValuesSymmetric(1e4, exclude_targets=["view"]),
+    ClipValues(1e-4, float("inf"), include_targets=[torch.nn.LayerNorm]),
+    TupleOutput(),
+]
 
 
 @register(BertForPreTraining)
@@ -82,19 +88,22 @@ class PipelinedBertForPreTraining(BertForPreTraining, PipelineMixin):
         log_insertions = self.ipu_config.log_insertions
         layer_ipu = get_layer_ipu(self.ipu_config.layers_per_ipu)
         transformations = [
-            ChangeTrueDivToMulByInverse(),
-            MergeLinears(),
-            # FuseBiasInLinear(),
-            AddPoptorchBlock(
-                "Embedding", layer_ipu=0, module_name_regex="bert.embeddings", log_insertions=log_insertions
-            ),
+            AddPoptorchBlock("Embedding", 0, "bert.embeddings", log_insertions=log_insertions),
             OutlineAttribute("bert.embeddings.LayerNorm", "Embedding"),
             AddPoptorchBlocksInSeries(
-                "Encoder", layer_ipu, module_name_regex=r"bert.encoder.layer.[0-9]+", log_insertions=log_insertions
+                "Encoder", layer_ipu, r"bert.encoder.layer.[0-9]+", log_insertions=log_insertions
             ),
             AddPoptorchBlock("Pooler Output", 0, "bert.pooler", log_insertions=log_insertions),
             AddPoptorchBlock("Classifier Output", 0, "cls", log_insertions=log_insertions),
         ]
+        if self.ipu_config.recompute_checkpoint_every_layer:
+            transformations.append(
+                RecomputationCheckpoint(
+                    "bert.encoder.layer.[0-9]+", to_exclude=f"bert.encoder.layer.{self.config.num_hidden_layers - 1}"
+                )
+            )
+        if self.ipu_config.embedding_serialization_factor > 1:
+            transformations.append(LinearToSerializedLinear("cls.predictions.decoder"))
         return transformations
 
     def parallelize(self):
@@ -108,10 +117,9 @@ class PipelinedBertForPreTraining(BertForPreTraining, PipelineMixin):
         super().parallelize()
         traced = symbolic_trace_pipelined_model(self)
         transformations = self.get_transformations()
-        # if self.ipu_config.embedding_serialization_factor > 1:
-        #     transformations.append(LinearToSerializedLinear("cls.predictions.decoder"))
+        transformations += _OPTIMIZATION_TRANSFORMATIONS
         composition = compose(*transformations)
-        non_reversible_composition = compose(ClipValues(1e4), TupleOutput())
+        non_reversible_composition = compose(*_NON_REVERSIBLE_TRANSFORMATIONS)
         traced = composition(traced)
         traced = non_reversible_composition(traced)
         return traced
@@ -124,8 +132,7 @@ class PipelinedBertForPreTraining(BertForPreTraining, PipelineMixin):
         """
         super().deparallelize()
         transformations = self.get_transformations()
-        if self.ipu_config.embedding_serialization_factor > 1:
-            transformations.append(LinearToSerializedLinear("cls.predictions.decoder"))
+        transformations += _OPTIMIZATION_TRANSFORMATIONS
         composition = compose(*transformations)
         self = composition(self, reverse=True)
         return self
@@ -218,20 +225,21 @@ class PipelinedBertForMaskedLM(BertForMaskedLM, PipelineMixin):
         log_insertions = self.ipu_config.log_insertions
         layer_ipu = get_layer_ipu(self.ipu_config.layers_per_ipu)
         transformations = [
-            AddPoptorchBlock(
-                "Embedding", layer_ipu=0, module_name_regex="bert.embeddings", log_insertions=log_insertions
-            ),
+            AddPoptorchBlock("Embedding", 0, "bert.embeddings", log_insertions=log_insertions),
             OutlineAttribute("bert.embeddings.LayerNorm", "Embedding"),
             AddPoptorchBlocksInSeries(
-                "Encoder", layer_ipu, module_name_regex=r"bert.encoder.layer.[0-9]+", log_insertions=log_insertions
+                "Encoder", layer_ipu, r"bert.encoder.layer.[0-9]+", log_insertions=log_insertions
             ),
             AddPoptorchBlock("Classifier Output", 0, "cls", log_insertions=log_insertions),
         ]
         if self.ipu_config.recompute_checkpoint_every_layer:
-            transformations.append(RecomputationCheckpoint("bert.encoder.layer.[0-9]+", to_exclude=f"bert.encoder.layer.{self.config.num_hidden_layers - 1}"))
+            transformations.append(
+                RecomputationCheckpoint(
+                    "bert.encoder.layer.[0-9]+", to_exclude=f"bert.encoder.layer.{self.config.num_hidden_layers - 1}"
+                )
+            )
         if self.ipu_config.embedding_serialization_factor > 1:
             transformations.append(LinearToSerializedLinear("cls.predictions.decoder"))
-        transformations += [ChangeTrueDivToMulByInverse(), MergeLinears()]
         return transformations
 
     def parallelize(self):
@@ -245,13 +253,11 @@ class PipelinedBertForMaskedLM(BertForMaskedLM, PipelineMixin):
         super().parallelize()
         traced = symbolic_trace_pipelined_model(self)
         transformations = self.get_transformations()
+        transformations += _OPTIMIZATION_TRANSFORMATIONS
         composition = compose(*transformations)
-        non_reversible_composition = compose(ClipValues(1e4), TupleOutput())
-
+        non_reversible_composition = compose(*_NON_REVERSIBLE_TRANSFORMATIONS)
         traced = composition(traced)
         traced = non_reversible_composition(traced)
-        import pdb; pdb.set_trace()
-
         return traced
 
     def deparallelize(self):
@@ -261,11 +267,10 @@ class PipelinedBertForMaskedLM(BertForMaskedLM, PipelineMixin):
         compatible with the original model.
         """
         super().deparallelize()
-
         transformations = self.get_transformations()
+        transformations += _OPTIMIZATION_TRANSFORMATIONS
         composition = compose(*transformations)
         self = composition(self, reverse=True)
-
         return self
 
     def forward(self, input_ids, attention_mask, token_type_ids=None, labels=None):
@@ -302,19 +307,23 @@ class BertPipelineMixin(PipelineMixin):
         layer_ipu = get_layer_ipu(self.ipu_config.layers_per_ipu)
         last_ipu = len(self.ipu_config.layers_per_ipu) - 1
         transformations = [
-            ChangeTrueDivToMulByInverse(),
-            MergeLinears(),
-            AddPoptorchBlock(
-                "Embedding", layer_ipu=0, module_name_regex="bert.embeddings", log_insertions=log_insertions
-            ),
+            AddPoptorchBlock("Embedding", 0, "bert.embeddings", log_insertions=log_insertions),
             OutlineAttribute("bert.embeddings.LayerNorm", "Embedding"),
             AddPoptorchBlocksInSeries(
-                "Encoder", layer_ipu, module_name_regex=r"bert.encoder.layer.[0-9]+", log_insertions=log_insertions
+                "Encoder", layer_ipu, r"bert.encoder.layer.[0-9]+", log_insertions=log_insertions
             ),
             # Only one of the following AddPoptorchBlock, will actually add a block.
             AddPoptorchBlock("Classifier Output", last_ipu, "classifier", log_insertions=log_insertions),
             AddPoptorchBlock("QA Outputs", last_ipu, "qa_outputs", log_insertions=log_insertions),
         ]
+        if self.ipu_config.recompute_checkpoint_every_layer:
+            transformations.append(
+                RecomputationCheckpoint(
+                    "bert.encoder.layer.[0-9]+", to_exclude=f"bert.encoder.layer.{self.config.num_hidden_layers - 1}"
+                )
+            )
+        if self.ipu_config.embedding_serialization_factor > 1:
+            transformations.append(VocabEmbeddingToSerializedEmbedding())
         return transformations
 
     @property
@@ -330,26 +339,13 @@ class BertPipelineMixin(PipelineMixin):
         - Adds recomputation checkpoints
         """
         super().parallelize()
-
-        # if self.ipu_config.recompute_checkpoint_every_layer:
-        #     for layer in self.bert.encoder.layer[:-1]:
-        #         h = recomputation_checkpoint(layer)
-        #         self._hooks.append(h)
-
         traced = symbolic_trace_pipelined_model(self)
-
         transformations = self.get_transformations()
-
-        if traced.ipu_config.embedding_serialization_factor > 1:
-            transformations.append(VocabEmbeddingToSerializedEmbedding())
-
+        transformations += _OPTIMIZATION_TRANSFORMATIONS
         composition = compose(*transformations)
-
-        non_reversible_composition = compose(ClipValues(1e4), TupleOutput())
-
+        non_reversible_composition = compose(*_NON_REVERSIBLE_TRANSFORMATIONS)
         traced = composition(traced)
         traced = non_reversible_composition(traced)
-
         return traced
 
     def deparallelize(self):
@@ -359,17 +355,10 @@ class BertPipelineMixin(PipelineMixin):
         compatible with the original model.
         """
         super().deparallelize()
-
         transformations = self.get_transformations()
-        if self.ipu_config.embedding_serialization_factor > 1:
-            transformations.append(VocabEmbeddingToSerializedEmbedding())
-
-        # if self.ipu_config.recompute_checkpoint_every_layer:
-        #     transformations.append(RecomputationCheckpoint())
-
+        transformations += _OPTIMIZATION_TRANSFORMATIONS
         composition = compose(*transformations)
         self = composition(self, reverse=True)
-
         return self
 
 
@@ -383,6 +372,7 @@ class PipelinedBertForSequenceClassification(BertForSequenceClassification, Bert
     model = PipelinedBertForSequenceClassification(config).parallelize().half()
     ```
     """
+
     pass
 
 
@@ -396,6 +386,7 @@ class PipelinedBertForMultipleChoice(BertForMultipleChoice, BertPipelineMixin):
     model = PipelinedBertForMultipleChoice(config).parallelize().half()
     ```
     """
+
     pass
 
 
@@ -409,6 +400,7 @@ class PipelinedBertForTokenClassification(BertForTokenClassification, BertPipeli
     model = PipelinedBertForTokenClassification(config).parallelize().half()
     ```
     """
+
     pass
 
 
